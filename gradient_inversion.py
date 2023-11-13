@@ -1,4 +1,5 @@
 from collections import defaultdict
+import copy
 import time
 import torch
 import torch.nn as nn
@@ -8,16 +9,18 @@ DEFAULT_CONFIG = dict(signed=False,
                       cost_fn='sim',
                       indices='def',
                       weights='equal',
-                      lr=0.01, #changed from 0.1 to 0.01
+                      lr=0.01, #changed from 0.1 to 0.001
                       optim='adam',
                       restarts=1,
-                      max_iterations=100,
-                      total_variation=0, #changed from 1e-1 to 0
+                      max_iterations=1000,
+                      nuclear_norm = 5e-5,
+                      binary_constraint=0.01,
+                      total_variation=0.001, #changed from 1e-1 to 0
                       bn_stat=0, #changed from 1e-1 to 0
                       image_norm=0, #changed from 1e-1 to 0
                       z_norm=0,
                       group_lazy=0, #changed from 1e-1 to 0
-                      init='randn',
+                      init='prior',
                       lr_decay=True,
 
                       dataset='CIFAR10',
@@ -43,10 +46,10 @@ def _validate_config(config):
     return config
 
 
-def total_variation(x): #(1,48,76)
+def total_variation(x):
     """Anisotropic TV."""
-    dx = torch.mean(torch.abs(x[:, :, :-1] - x[:, :, :, 1:]))
-    dy = torch.mean(torch.abs(x[:, :-1, :] - x[:, :, 1:, :]))
+    dx = torch.mean(torch.abs(x[:, :, :-1] - x[:, :, 1:]))
+    dy = torch.mean(torch.abs(x[:, :-1, :] - x[:, 1:, :]))
     return dx + dy
 
 
@@ -178,6 +181,10 @@ def reconstruction_costs(gradients, input_gradient, cost_fn='l2', indices='def',
 
         # Accumulate final costs
         total_costs += costs
+        
+        #binary_penalty
+        # torch.sum((x[:, constrained_columns] - 0.5).pow(2))
+        
     return total_costs / len(gradients)
 
 class GradientReconstructor():
@@ -259,7 +266,7 @@ class GradientReconstructor():
             print(f"x: {n_x}")
         self.n_trainable = n_z + n_G + n_x
 
-    def reconstruct(self, input_data, labels, data_shape=(48, 76), dryrun=False, eval=True, tol=None):
+    def reconstruct(self, input_data, labels, ground_truth, data_shape=(48, 76), dryrun=False, eval=True, tol=None):
         """Reconstruct image from gradient."""
         start_time = time.time()
         if eval:
@@ -270,6 +277,7 @@ class GradientReconstructor():
         
         stats = defaultdict(list)
         x = self._init_images(data_shape) #(#restarts, 1, 48, 76)
+        # x = ground_truth.unsqueeze(0)
         scores = torch.zeros(self.config['restarts'])
 
         try:
@@ -307,8 +315,10 @@ class GradientReconstructor():
             for iteration in range(max_iterations):
                 for trial in range(self.config['restarts']):
                     losses = [0,0,0,0]
-                    # x_trial = _x[trial]
-                    # x_trial.requires_grad = True
+                    
+                    # apply binary constraint
+                    # _x_sigmoid = sigmoid(_x[trial][:,:, 4:49])
+                    # _x[trial] = torch.cat([_x[trial][:,:, :4], _x_sigmoid, _x[trial][:,:, 49:]], dim=-1)
                     
                     #Group Regularizer
                     if trial == 0 and iteration + 1 == construct_group_mean_at and self.config['group_lazy'] > 0:
@@ -316,12 +326,12 @@ class GradientReconstructor():
                         self.group_mean = torch.mean(torch.stack(_x), dim=0).detach().clone()
 
                     self.dummy_z = None
-                    # print(x_trial)
-                    closure = self._gradient_closure(optimizer[trial], _x[trial], input_data, labels, losses)
+                    closure = self._gradient_closure(optimizer[trial], _x[trial], input_data, labels, losses, iteration)
+                    
                     rec_loss = optimizer[trial].step(closure)
                     if self.config['lr_decay']:
                         scheduler[trial].step()
-
+                                        
                     with torch.no_grad():
                         # Project into image space
                         # _x[trial].data = torch.max(torch.min(_x[trial], (1 - dm) / ds), -dm / ds)
@@ -330,6 +340,11 @@ class GradientReconstructor():
                             print(f'It: {iteration}. Rec. loss: {rec_loss.item():.6f}')
                             if self.config['z_norm'] > 0:
                                 print(torch.norm(dummy_z[trial], 2).item())
+
+                    scores = scores[torch.isfinite(scores)]
+                    optimal_index = torch.argmin(scores)
+                    stats['opt'] = scores[optimal_index].item()
+                    x_intermediate = copy.deepcopy(x[optimal_index].detach())
 
         except KeyboardInterrupt:
             print(f'Recovery interrupted manually in iteration {iteration}!')
@@ -352,13 +367,18 @@ class GradientReconstructor():
         x_optimal = x[optimal_index]
 
         print(f'Total time: {time.time()-start_time}.')
-        return x_optimal.detach(), stats
+
+        # apply binary constraint
+        x_optimal[:,:,0:2] = (x_optimal[:,:,0:2] > 0.5).float()
+        x_optimal[:,:,4:49] = (x_optimal[:,:,4:49] > 0.5).float()
+        x_optimal[:,:,59:] = (x_optimal[:,:,59:] > 0.5).float()
+        
+        return [x_intermediate.detach(),x_optimal.detach()], stats
 
 
     def reconstruct_theta(self, input_gradients, labels, models, candidate_images, img_shape=(3, 32, 32), dryrun=False, eval=True, tol=None):
         """Reconstruct image from gradient."""
         start_time = time.time()
-        print("check")
         if eval:
             self.model.eval()
 
@@ -466,12 +486,32 @@ class GradientReconstructor():
             return (torch.rand((self.config['restarts'], self.num_images, *img_shape), **self.setup) - 0.5) * 2
         elif self.config['init'] == 'zeros':
             return torch.zeros((self.config['restarts'], self.num_images, *img_shape), **self.setup)
+        elif self.config['init'] == 'prior':
+            
+            mean,std = self.mean_std
+            
+            init = torch.randn(img_shape, **self.setup)
+            
+            for i in range(img_shape[0]):
+                for j in range(img_shape[1]):
+                    init[i,j] = torch.normal(mean[i, j], std[i, j])
+            
+            # make every element no more than 2 std away from mean
+            init = torch.max(torch.min(init, mean + 2*std), mean - 2*std)
+            
+            init = torch.clamp(init, -3, 3)
+            init = init.repeat(self.config['restarts'], self.num_images, 1, 1)
+            
+            # init = torch.randn((self.config['restarts'], self.num_images, *img_shape), **self.setup)
+            # init[:, :, : , 4:49] = 0.5
+            # init[:, :, : , 59:] = 0.5
+            return init
         else:
             raise ValueError()
 
 
-    def _gradient_closure(self, optimizer, x_trial, input_gradient, label, losses):
-        def closure():
+    def _gradient_closure(self, optimizer, x_trial, input_gradient, label, losses, iteration):
+        def closure():           
             num_images = label.shape[0]
             num_gradients = len(input_gradient)
             batch_size = num_images // num_gradients
@@ -480,17 +520,43 @@ class GradientReconstructor():
             total_loss = 0
             optimizer.zero_grad()
             self.model.zero_grad()
+            
             for i in range(num_batch):
                 batch_input = x_trial[i,:,].unsqueeze(0)
                 batch_label = label[i].reshape(-1)
-
+                
                 loss = self.loss_fn(self.model(batch_input).view(-1), batch_label.float())
                 gradient = torch.autograd.grad(loss, self.model.parameters(), create_graph=True)
                 rec_loss = reconstruction_costs([gradient], input_gradient[i],
                                                 cost_fn=self.config['cost_fn'], indices=self.config['indices'],
                                                 weights=self.config['weights'])
+                           
+                #penalty for binary constraint
+                if self.config['binary_constraint'] > 0:
+                    binary_distance = (batch_input[:,:, 0:2].pow(2) * (1 - batch_input[:,:, 0:2]).pow(2)).mean()
+                    binary_distance += (batch_input[:,:, 4:49].pow(2) * (1 - batch_input[:,:, 4:49]).pow(2)).mean()
+                    binary_distance += (batch_input[:,:, 59:].pow(2) * (1 - batch_input[:,:, 59:]).pow(2)).mean()
+                    # binary_distance += torch.sum(torch.min(torch.abs(batch_input[:,:, 4:49]), torch.abs(1 - batch_input[:,:, 4:49])).pow(2).mean())
+                    # binary_distance += torch.sum(torch.min(torch.abs(batch_input[:,:, 59:]), torch.abs(1 - batch_input[:,:, 59:])).pow(2).mean())
+                    rec_loss += self.config['binary_constraint'] * binary_distance
+            
+                    
+                    # binary_distance = torch.sum(torch.min(torch.abs(batch_input[:,:, 0:2]), torch.abs(1 - batch_input[:,:, 0:2])).pow(2).mean())
+                    # binary_distance += torch.sum(torch.min(torch.abs(batch_input[:,:, 4:49]), torch.abs(1 - batch_input[:,:, 4:49])).pow(2).mean())
+                    # binary_distance += torch.sum(torch.min(torch.abs(batch_input[:,:, 59:]), torch.abs(1 - batch_input[:,:, 59:])).pow(2).mean())
+                    # rec_loss += self.config['binary_constraint'] * binary_distance
+                if self.config['nuclear_norm'] > 0:
+                    nuclear_norm = torch.linalg.matrix_norm(batch_input,ord="nuc")
+                    rec_loss += self.config["nuclear_norm"] * nuclear_norm.squeeze()
+                
+                #penalty for total variation
+                if self.config['total_variation'] > 0:
+                    tv_loss = total_variation(batch_input)
+                    rec_loss += self.config['total_variation'] * tv_loss
+                
                 total_loss += rec_loss
-            total_loss.backward()
+           
+            total_loss.backward(retain_graph=True)            
             return total_loss
         return closure
 

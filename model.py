@@ -42,8 +42,8 @@ class LSTM(nn.Module):
         
         x = x[:, -1, :]
 
-        if self.dropout > 0:
-            x = nn.Dropout(self.dropout)(x)
+        # if self.dropout > 0:
+        #     x = nn.Dropout(self.dropout)(x)
 
         if m is not None:
             x = x * m.unsqueeze(-1).float()  # Applying the mask, if provided

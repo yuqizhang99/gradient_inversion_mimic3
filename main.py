@@ -4,6 +4,7 @@ Optional arguments can be found in inversefed/options.py
 This CLI can recover the baseline experiments.
 """
 
+import pandas as pd
 import torch
 import torchvision
 import torch.nn as nn
@@ -26,7 +27,7 @@ from model import LSTM
 import gradient_inversion as gi
 
 #Model Configuration
-DIM =  16 
+DIM =  64
 DEPTH = 2
 DROPOUT = 0.3
 #Inversion Configuration
@@ -89,7 +90,7 @@ def get_dataloader():
 def train_model(criterion, optimizer, model, train_loader, val_loader, num_epochs=10):
 
     # Training loop
-    for epoch in range(10):  # Adjust the number of epochs
+    for epoch in range(num_epochs):  # Adjust the number of epochs
         model.train()
         total_loss = 0.0
 
@@ -106,7 +107,7 @@ def train_model(criterion, optimizer, model, train_loader, val_loader, num_epoch
             total_loss += loss.item()
 
         print(f"Epoch {epoch+1}, Loss: {total_loss/len(train_loader)}")
-
+        
         model.eval()
         total_val_loss = 0.0
         with torch.no_grad():
@@ -147,35 +148,63 @@ if __name__ == "__main__":
     model.to(DEVICE)
     model.eval()
     
+    
+    input_stack = []
+    for (input,label) in trainloader.dataset:
+        input_stack.append(input)
+    #get mean
+    mean = torch.mean(torch.stack(input_stack), dim=0)
+    #get std
+    std = torch.std(torch.stack(input_stack), dim=0)
+    
+    
     #gradient inversion
     for i in range(num_exp):
         # here we just try to reconstruct one data point
-        ground_truth, labels = validloader.dataset[0] # get the first one (48,76) (1)
+        ground_truth, labels = validloader.dataset[1] # get the first one (48,76) (1)
         
         ground_truth = ground_truth.unsqueeze(0).to(DEVICE) # (1,48,76)
-        labels = labels.view(-1).to(DEVICE)
         
+        ground_truth_2d = ground_truth.squeeze(0)
+
+        # Convert the 2D tensor to a Pandas DataFrame
+        ground_truth_df = pd.DataFrame(ground_truth_2d.numpy())
+
+        # Save the DataFrame to a CSV file
+        ground_truth_df.to_csv('ground_truth.csv', index=False)
+        
+        labels = labels.view(-1).to(DEVICE)
         target_loss = criterion(model(ground_truth).view(-1), labels.float())
         input_gradient = torch.autograd.grad(target_loss, model.parameters())
         input_gradient = [grad.detach() for grad in input_gradient]
 
-        rec_machine = gi.GradientReconstructor(model)
+        rec_machine = gi.GradientReconstructor(model,mean_std=(mean,std))
 
-        output, stats = rec_machine.reconstruct(input_gradient, labels.reshape(-1), data_shape=(48,76))
-
+        [intermediate,output], stats = rec_machine.reconstruct(input_gradient, labels.reshape(-1), data_shape=(48,76),ground_truth=ground_truth)
         # Compute stats and save to a table:
 
         feat_mse = (model(output) - model(ground_truth)).pow(2).mean().item()
         print(f"Rec. loss: {stats['opt']:2.4f} | FMSE: {feat_mse:2.4e} |")
 
-        plt.subplot(1, 2, 1)
-        plt.imshow(ground_truth[0], cmap='viridis', aspect='auto')
+
+        #make sure the 3 subplots have the same colorbar
+        vmin = min(ground_truth.min(),intermediate.min(),output.min())
+        vmax = max(ground_truth.max(),intermediate.max(),output.max())       
+        
+        plt.subplot(1, 3, 1)
+        
+        plt.imshow(ground_truth[0], cmap='viridis', aspect='auto',vmin=vmin,vmax=vmax)
         plt.colorbar()
         plt.title("Ground Truth")
+        
+        plt.subplot(1, 3, 2)
+        plt.imshow(intermediate[0], cmap='viridis', aspect='auto',vmin=vmin,vmax=vmax)
+        plt.colorbar()
+        plt.title("Intermediate")
 
         # Plot predictions
-        plt.subplot(1, 2, 2)
-        plt.imshow(output[0], cmap='viridis', aspect='auto')
+        plt.subplot(1, 3, 3)
+        plt.imshow(output[0], cmap='viridis', aspect='auto',vmin=vmin,vmax=vmax)
         plt.colorbar()
         plt.title("Predicted")
 
